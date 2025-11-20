@@ -146,6 +146,7 @@ class SmartIRLight(LightEntity, RestoreEntity):
         self._brightnesses = device_data["brightness"]
         self._colortemps = device_data["colorTemperature"]
         self._commands = device_data["commands"]
+        self._header_code = device_data.get("headerCode")
 
         self._power = STATE_ON
         self._brightness = None
@@ -187,6 +188,7 @@ class SmartIRLight(LightEntity, RestoreEntity):
             self._commands_encoding,
             self._controller_data,
             self._delay,
+            self._header_code,
         )
 
     async def async_added_to_hass(self):

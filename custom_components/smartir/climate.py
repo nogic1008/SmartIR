@@ -124,6 +124,7 @@ class SmartIRClimate(ClimateEntity, RestoreEntity):
         self._fan_modes = device_data['fanModes']
         self._swing_modes = device_data.get('swingModes')
         self._commands = device_data['commands']
+        self._header_code = device_data.get('headerCode')
 
         self._target_temperature = self._min_temperature
         self._hvac_mode = HVACMode.OFF
@@ -154,8 +155,10 @@ class SmartIRClimate(ClimateEntity, RestoreEntity):
             self._supported_controller,
             self._commands_encoding,
             self._controller_data,
-            self._delay)
-            
+            self._delay,
+            self._header_code,
+        )
+
     async def async_added_to_hass(self):
         """Run when entity about to be added."""
         await super().async_added_to_hass()

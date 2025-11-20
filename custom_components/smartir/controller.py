@@ -28,30 +28,38 @@ LOOKIN_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW]
 ESPHOME_COMMANDS_ENCODING = [ENC_RAW]
 
 
-def get_controller(hass, controller, encoding, controller_data, delay):
+def get_controller(
+    hass, controller, encoding, controller_data, delay, header_code=None
+):
     """Return a controller compatible with the specification provided."""
     controllers = {
         BROADLINK_CONTROLLER: BroadlinkController,
         XIAOMI_CONTROLLER: XiaomiController,
         MQTT_CONTROLLER: MQTTController,
         LOOKIN_CONTROLLER: LookinController,
-        ESPHOME_CONTROLLER: ESPHomeController
+        ESPHOME_CONTROLLER: ESPHomeController,
     }
     try:
-        return controllers[controller](hass, controller, encoding, controller_data, delay)
+        return controllers[controller](
+            hass, controller, encoding, controller_data, delay, header_code
+        )
     except KeyError:
         raise Exception("The controller is not supported.")
 
 
 class AbstractController(ABC):
     """Representation of a controller."""
-    def __init__(self, hass, controller, encoding, controller_data, delay):
+
+    def __init__(
+        self, hass, controller, encoding, controller_data, delay, header_code=None
+    ):
         self.check_encoding(encoding)
         self.hass = hass
         self._controller = controller
         self._encoding = encoding
         self._controller_data = controller_data
         self._delay = delay
+        self._header_code = header_code
 
     @abstractmethod
     def check_encoding(self, encoding):

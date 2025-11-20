@@ -100,6 +100,7 @@ class SmartIRMediaPlayer(MediaPlayerEntity, RestoreEntity):
         self._supported_controller = device_data['supportedController']
         self._commands_encoding = device_data['commandsEncoding']
         self._commands = device_data['commands']
+        self._header_code = device_data.get('headerCode')
 
         self._state = STATE_OFF
         self._sources_list = []
@@ -150,7 +151,9 @@ class SmartIRMediaPlayer(MediaPlayerEntity, RestoreEntity):
             self._supported_controller, 
             self._commands_encoding,
             self._controller_data,
-            self._delay)
+            self._delay,
+            self._header_code,
+        )
 
     async def async_added_to_hass(self):
         """Run when entity about to be added."""
