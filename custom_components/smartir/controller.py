@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from base64 import b64encode
 import binascii
+import struct
 import requests
 import logging
 import json
@@ -20,11 +21,12 @@ ENC_BASE64 = 'Base64'
 ENC_HEX = 'Hex'
 ENC_PRONTO = 'Pronto'
 ENC_RAW = 'Raw'
+ENC_NEC = 'Nec'
 
-BROADLINK_COMMANDS_ENCODING = [ENC_BASE64, ENC_HEX, ENC_PRONTO]
-XIAOMI_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW]
+BROADLINK_COMMANDS_ENCODING = [ENC_BASE64, ENC_HEX, ENC_PRONTO, ENC_NEC]
+XIAOMI_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW, ENC_NEC]
 MQTT_COMMANDS_ENCODING = [ENC_RAW]
-LOOKIN_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW]
+LOOKIN_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW, ENC_NEC]
 ESPHOME_COMMANDS_ENCODING = [ENC_RAW]
 
 
@@ -75,6 +77,45 @@ class AbstractController(ABC):
 class BroadlinkController(AbstractController):
     """Controls a Broadlink device."""
 
+    @staticmethod
+    def lirc2broadlink(pulses: list[float]) -> str:
+        """Convert IR pulse timings to Broadlink base64-encoded command.
+
+        Parameters
+        ----------
+        pulses : list[float]
+            Infrared pulse sequence (in microseconds). ON/OFF alternate.
+
+        Returns
+        -------
+        str
+            Broadlink base64-encoded IR command.
+        """
+        array: bytearray = bytearray()
+
+        for pulse in pulses:
+            # Quantize to Broadlink tick unit (≈ 30.45 µs) and convert
+            # Broadlink tick unit ≈ (8192 / 269) µs
+            pulse = round(pulse * 269 / 8192)
+
+            if pulse < 256:
+                array += bytearray(struct.pack(">B", pulse))
+            else:
+                array += bytearray([0x00])
+                array += bytearray(struct.pack(">H", pulse))
+
+        packet: bytearray = bytearray([0x26, 0x00])
+        packet += bytearray(struct.pack("<H", len(array)))
+        packet += array
+        packet += bytearray([0x0D, 0x05])
+
+        # Add 0s to make ultimate packet size a multiple of 16 for 128-bit AES encryption.
+        remainder: int = (len(packet) + 4) % 16
+        if remainder:
+            packet += bytearray(16 - remainder)
+
+        return b64encode(packet).decode("utf-8")
+
     def check_encoding(self, encoding):
         """Check if the encoding is supported by the controller."""
         if encoding not in BROADLINK_COMMANDS_ENCODING:
@@ -99,14 +140,23 @@ class BroadlinkController(AbstractController):
 
             if self._encoding == ENC_PRONTO:
                 try:
-                    _command = _command.replace(' ', '')
-                    _command = bytearray.fromhex(_command)
-                    _command = Helper.pronto2lirc(_command)
-                    _command = Helper.lirc2broadlink(_command)
-                    _command = b64encode(_command).decode('utf-8')
+                    _command = _command.replace(" ", "")
+                    pronto_bytes = bytearray.fromhex(_command)
+                    pulses = Helper.pronto_to_lirc(pronto_bytes)
+                    _command = self.lirc2broadlink(pulses)
                 except:
-                    raise Exception("Error while converting "
-                                    "Pronto to Base64 encoding")
+                    raise Exception("Error while converting Pronto to Base64 encoding")
+
+            if self._encoding == ENC_NEC:
+                try:
+                    header_bytes = Helper.convert_to_hex(self._header_code)
+                    command_bytes = Helper.convert_to_hex(_command)
+                    if command_bytes is None:
+                        raise ValueError("NEC command hex string is None")
+                    pulses = Helper.nec_to_lirc(header_bytes, command_bytes)
+                    _command = self.lirc2broadlink(pulses)
+                except Exception:
+                    raise Exception("Error while converting NEC to Base64 encoding")
 
             commands.append('b64:' + _command)
 
@@ -131,9 +181,25 @@ class XiaomiController(AbstractController):
 
     async def send(self, command):
         """Send a command."""
+
+        if self._encoding == ENC_NEC:
+            # Convert NEC to Pronto
+            header_bytes = Helper.convert_to_hex(self._header_code)
+            command_bytes = Helper.convert_to_hex(command)
+            if command_bytes is None:
+                raise ValueError("NEC command hex string is None")
+            pulses = Helper.nec_to_lirc(header_bytes, command_bytes)
+            pronto_bytes = Helper.lirc_to_pronto(pulses)
+
+            encoding = ENC_PRONTO.lower()
+            send_command = " ".join(f"{b:02X}" for b in pronto_bytes)
+        else:
+            encoding = self._encoding.lower()
+            send_command = command
+
         service_data = {
             ATTR_ENTITY_ID: self._controller_data,
-            'command':  self._encoding.lower() + ':' + command
+            "command": encoding + ":" + send_command,
         }
 
         await self.hass.services.async_call(
@@ -171,9 +237,24 @@ class LookinController(AbstractController):
 
     async def send(self, command):
         """Send a command."""
-        encoding = self._encoding.lower().replace('pronto', 'prontohex')
+
+        if self._encoding == ENC_NEC:
+            # Convert NEC to Pronto
+            header_bytes = Helper.convert_to_hex(self._header_code)
+            command_bytes = Helper.convert_to_hex(command)
+            if command_bytes is None:
+                raise ValueError("NEC command hex string is None")
+            pulses = Helper.nec_to_lirc(header_bytes, command_bytes)
+            pronto_bytes = Helper.lirc_to_pronto(pulses)
+
+            encoding = 'prontohex'
+            send_command = " ".join(f"{b:02X}" for b in pronto_bytes)
+        else:
+            encoding = self._encoding.lower().replace('pronto', 'prontohex')
+            send_command = command
+
         url = f"http://{self._controller_data}/commands/ir/" \
-                f"{encoding}/{command}"
+                f"{encoding}/{send_command}"
         await self.hass.async_add_executor_job(requests.get, url)
 
 

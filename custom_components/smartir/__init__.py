@@ -124,6 +124,17 @@ async def _update(hass, branch, do_update=False, notify_if_latest=True):
        _LOGGER.error("An error occurred while checking for updates.")
 
 class Helper():
+
+    @staticmethod
+    def convert_to_hex(s: str | None) -> bytes | None:
+        """
+        Remove spaces and 0x/0X prefix from hex string, and return bytes. If None, return None.
+        """
+        if s is None:
+            return None
+        s_clean = s.replace(" ", "").replace("0X", "").replace("0x", "")
+        return bytes.fromhex(s_clean)
+
     @staticmethod
     async def downloader(source, dest):
         async with aiohttp.ClientSession() as session:
@@ -135,37 +146,168 @@ class Helper():
                     raise Exception("File not found")
 
     @staticmethod
-    def pronto2lirc(pronto):
-        codes = [int(binascii.hexlify(pronto[i:i+2]), 16) for i in range(0, len(pronto), 2)]
+    def pronto_to_lirc(pronto: bytes) -> list[float]:
+        """Convert Pronto Hex format to raw IR pulse timings (microseconds).
+
+        The Pronto Hex format encodes infrared remote control signals as a series
+        of burst pairs, where each pair represents ON/OFF durations for the IR emitter.
+        This function decodes the format and converts it to microsecond timings.
+
+        Pronto Format Structure
+        -----------------------
+        Word 0: Code type (0x0000 = learned/raw data)
+        Word 1: Carrier frequency (freq_khz = 1000000 / (N * 0.241246))
+        Word 2: Number of burst pairs in sequence 1 (once sequence)
+        Word 3: Number of burst pairs in sequence 2 (repeat sequence)
+        Words 4+: Burst pair data (each pair = ON duration, OFF duration)
+
+        Each burst pair value represents the number of carrier cycles for which
+        the IR emitter should be ON or OFF. The timing calculation follows the
+        official specification:
+
+            freq_hz   = 1_000_000 / (N * 0.241246)
+            period_us = N * 0.241246
+            time_us   = cycles * period_us = cycles * N * 0.241246
+
+        Using the period directly (rather than dividing by frequency) reduces
+        floating point error. No rounding is performed; rounding is deferred to
+        the final device-specific quantization step.
+
+        Parameters
+        ----------
+        pronto : bytes
+            Pronto Hex format as bytes (big-endian 16-bit words).
+
+        Returns
+        -------
+        list[float]
+            IR pulse sequence in microseconds. ON/OFF durations alternate.
+
+        Raises
+        ------
+        ValueError
+            If the format is invalid (doesn't start with 0x0000, or length mismatch).
+        """
+        codes: list[int] = [
+            int(binascii.hexlify(pronto[i : i + 2]), 16)
+            for i in range(0, len(pronto), 2)
+        ]
 
         if codes[0]:
             raise ValueError("Pronto code should start with 0000")
+
+        # Length should be: 4 (preamble) + 2 * (seq1_pairs + seq2_pairs)
         if len(codes) != 4 + 2 * (codes[2] + codes[3]):
             raise ValueError("Number of pulse widths does not match the preamble")
 
-        frequency = 1 / (codes[1] * 0.241246)
-        return [int(round(code / frequency)) for code in codes[4:]]
+        period_us: float = codes[1] * 0.241246
+        return [code * period_us for code in codes[4:]]
 
     @staticmethod
-    def lirc2broadlink(pulses):
-        array = bytearray()
+    def nec_to_lirc(
+        header_bytes: bytes | None,
+        command_bytes: bytes,
+    ) -> list[float]:
+        """Convert NEC frame data to raw IR pulse timings (microseconds).
 
-        for pulse in pulses:
-            pulse = int(pulse * 269 / 8192)
+        Parameters
+        ----------
+        header_bytes : bytes | None
+            Customer code bytes (1 or 2 bytes). If length 1, an inverted byte is
+            appended automatically (extended to 16-bit). If None, command_bytes is
+            treated as the full frame (already composed).
+        command_bytes : bytes
+            Command payload bytes (MSB-first)
 
-            if pulse < 256:
-                array += bytearray(struct.pack('>B', pulse))
+        Returns
+        -------
+        list[float]
+            Infrared pulse sequence (microseconds). Alternating ON/OFF durations.
+
+        Raises
+        ------
+        ValueError
+            If header_bytes length is invalid.
+        """
+        if header_bytes is not None:
+            if len(header_bytes) == 1:
+                # 8bit: append inverted byte to extend to 16bit
+                header_bytes = bytes([header_bytes[0], (~header_bytes[0]) & 0xFF])
+            elif len(header_bytes) == 2:
+                # 16bit: use as is
+                pass
             else:
-                array += bytearray([0x00])
-                array += bytearray(struct.pack('>H', pulse))
+                raise ValueError("NEC header_bytes must be 1 or 2 bytes")
 
-        packet = bytearray([0x26, 0x00])
-        packet += bytearray(struct.pack('<H', len(array)))
-        packet += array
-        packet += bytearray([0x0d, 0x05])
+            inv_cmd_bytes: bytes = bytes([(b ^ 0xFF) for b in command_bytes])
+            data_bytes: bytes = header_bytes + command_bytes + inv_cmd_bytes
+        else:
+            # Full frame already provided in command_bytes
+            data_bytes = command_bytes
 
-        # Add 0s to make ultimate packet size a multiple of 16 for 128-bit AES encryption.
-        remainder = (len(packet) + 4) % 16
-        if remainder:
-            packet += bytearray(16 - remainder)
-        return packet
+        def t(multiple: int) -> float:
+            """Return microseconds for (multiple * T)."""
+            # Base T derivation:
+            #   Remote IC clock = 455 kHz, divided by 256 -> = 256 / 455000 s
+            t_us: float = (256 / 455_000) * 1_000_000  # ≈ 562.637 µs
+            return t_us * multiple
+
+        pulses: list[float] = [t(16), t(8)]  # Leader code (ON: 16T, OFF: 8T)
+        for byte in data_bytes:
+            for bit_pos in range(8):  # LSB first
+                bit: int = (byte >> bit_pos) & 0x01
+                pulses += (
+                    [t(1), t(3)] if bit else [t(1), t(1)]
+                )  # 1: ON(1T), OFF(3T); 0: ON(1T), OFF(1T)
+
+        # Trailer code: ON(1T) -> OFF(nnT) where total becomes 192T
+        pulses.append(t(1))
+        trailer_off: float = t(192) - sum(pulses)
+        if trailer_off < 0:
+            raise ValueError("NEC frame is too long to fit in standard timing")
+        pulses.append(trailer_off)
+
+        return pulses
+
+    @staticmethod
+    def lirc_to_pronto(pulses: list[float], carrier_khz: float = 38.0) -> bytes:
+        """
+        Convert raw IR pulse timings (microseconds) to Pronto Hex format (bytes).
+
+        Parameters
+        ----------
+        pulses : list[float]
+            IR pulse sequence in microseconds. ON/OFF durations alternate.
+        carrier_khz : float, optional
+            Carrier frequency in kHz (default: 38.0)
+
+        Returns
+        -------
+        bytes
+            Pronto Hex format as bytes (big-endian 16-bit words)
+        """
+        if len(pulses) % 2 != 0:
+            raise ValueError("Pulse list must have even length (ON/OFF pairs)")
+
+        # Pronto carrier word: N = 1_000_000 / (carrier_khz * 0.241246)
+        n = round(1_000_000 / (carrier_khz * 0.241246))
+        period_us = n * 0.241246
+
+        # Convert each pulse to number of carrier periods (rounded)
+        burst_pairs = [round(p / period_us) for p in pulses]
+
+        # Pronto header:
+        # Word0: 0x0000 (raw/learned)
+        # Word1: carrier
+        # Word2: burst pair count (once sequence)
+        # Word3: 0 (no repeat sequence)
+        word0 = 0x0000
+        word1 = n
+        word2 = len(burst_pairs) // 2
+        word3 = 0x0000
+
+        words = [word0, word1, word2, word3] + burst_pairs
+
+        # Convert to bytes (big-endian 16bit)
+        pronto_bytes = b''.join(struct.pack('>H', w) for w in words)
+        return pronto_bytes
