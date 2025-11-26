@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from base64 import b64encode
 import binascii
+import struct
 import requests
 import logging
 import json
@@ -93,8 +94,8 @@ class BroadlinkController(AbstractController):
                 try:
                     _command = _command.replace(' ', '')
                     _command = bytearray.fromhex(_command)
-                    _command = Helper.pronto2lirc(_command)
-                    _command = Helper.lirc2broadlink(_command)
+                    _command = Helper.pronto_to_lirc(_command)
+                    _command = BroadlinkController.lirc_to_broadlink(_command)
                     _command = b64encode(_command).decode('utf-8')
                 except:
                     raise Exception("Error while converting "
@@ -111,6 +112,30 @@ class BroadlinkController(AbstractController):
         await self.hass.services.async_call(
             'remote', 'send_command', service_data)
 
+
+    @staticmethod
+    def lirc_to_broadlink(pulses):
+        array = bytearray()
+
+        for pulse in pulses:
+            pulse = int(pulse * 269 / 8192)
+
+            if pulse < 256:
+                array += bytearray(struct.pack('>B', pulse))
+            else:
+                array += bytearray([0x00])
+                array += bytearray(struct.pack('>H', pulse))
+
+        packet = bytearray([0x26, 0x00])
+        packet += bytearray(struct.pack('<H', len(array)))
+        packet += array
+        packet += bytearray([0x0d, 0x05])
+
+        # Add 0s to make ultimate packet size a multiple of 16 for 128-bit AES encryption.
+        remainder = (len(packet) + 4) % 16
+        if remainder:
+            packet += bytearray(16 - remainder)
+        return packet
 
 class XiaomiController(AbstractController):
     """Controls a Xiaomi device."""
