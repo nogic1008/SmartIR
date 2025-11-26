@@ -126,12 +126,10 @@ async def _update(hass, branch, do_update=False, notify_if_latest=True):
 class Helper():
 
     @staticmethod
-    def convert_to_hex(s: str | None) -> bytes | None:
+    def convert_to_hex(s: str) -> bytes:
         """
         Remove spaces and 0x/0X prefix from hex string, and return bytes. If None, return None.
         """
-        if s is None:
-            return None
         s_clean = s.replace(" ", "").replace("0X", "").replace("0x", "")
         return bytes.fromhex(s_clean)
 

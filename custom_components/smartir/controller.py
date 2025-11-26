@@ -21,11 +21,16 @@ ENC_BASE64 = 'Base64'
 ENC_HEX = 'Hex'
 ENC_PRONTO = 'Pronto'
 ENC_RAW = 'Raw'
+ENC_NEC = 'Nec'
+ENC_AEHA = 'Aeha'
+ENC_SONY = 'Sony'
+ENC_SHARP = 'Sharp'
 
-BROADLINK_COMMANDS_ENCODING = [ENC_BASE64, ENC_HEX, ENC_PRONTO]
-XIAOMI_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW]
+PROTOCOL_BASED_ENCODING = [ENC_NEC, ENC_AEHA, ENC_SONY, ENC_SHARP]
+BROADLINK_COMMANDS_ENCODING = [ENC_BASE64, ENC_HEX, ENC_PRONTO] + PROTOCOL_BASED_ENCODING
+XIAOMI_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW] + PROTOCOL_BASED_ENCODING
 MQTT_COMMANDS_ENCODING = [ENC_RAW]
-LOOKIN_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW]
+LOOKIN_COMMANDS_ENCODING = [ENC_PRONTO, ENC_RAW] + PROTOCOL_BASED_ENCODING
 ESPHOME_COMMANDS_ENCODING = [ENC_RAW]
 
 
@@ -46,6 +51,7 @@ def get_controller(hass, controller, encoding, controller_data, delay):
 
 class AbstractController(ABC):
     """Representation of a controller."""
+
     def __init__(self, hass, controller, encoding, controller_data, delay):
         self.check_encoding(encoding)
         self.hass = hass
@@ -64,6 +70,32 @@ class AbstractController(ABC):
         """Send a command."""
         pass
 
+    @staticmethod
+    def to_lirc(encoding: str, command: str) -> list[float]:
+        """Convert command to LIRC pulses based on encoding."""
+        if encoding == ENC_PRONTO:
+            command = command.replace(" ", "")
+            command_bytes = bytearray.fromhex(command)
+            return Helper.pronto_to_lirc(command_bytes)
+
+        if encoding == ENC_NEC:
+            command_bytes = Helper.convert_to_hex(command)
+            return Helper.nec_to_lirc(command_bytes)
+
+        if encoding == ENC_AEHA:
+            command_bytes = Helper.convert_to_hex(command)
+            return Helper.aeha_to_lirc(command_bytes)
+
+        if encoding == ENC_SONY:
+            command_bytes = Helper.convert_to_hex(command)
+            return Helper.sony_to_lirc(command_bytes)
+
+        if encoding == ENC_SHARP:
+            command_bytes = Helper.convert_to_hex(command)
+            return Helper.sharp_to_lirc(command_bytes)
+
+        raise ValueError(f"Encoding {encoding} cannot be converted to LIRC.")
+
 
 class BroadlinkController(AbstractController):
     """Controls a Broadlink device."""
@@ -78,28 +110,28 @@ class BroadlinkController(AbstractController):
         """Send a command."""
         commands = []
 
-        if not isinstance(command, list): 
+        if not isinstance(command, list):
             command = [command]
 
         for _command in command:
-            if self._encoding == ENC_HEX:
-                try:
+            try:
+                if self._encoding == ENC_HEX:
                     _command = binascii.unhexlify(_command)
-                    _command = b64encode(_command).decode('utf-8')
-                except:
-                    raise Exception("Error while converting "
-                                    "Hex to Base64 encoding")
+                    _command = b64encode(_command).decode("utf-8")
 
-            if self._encoding == ENC_PRONTO:
-                try:
-                    _command = _command.replace(' ', '')
-                    _command = bytearray.fromhex(_command)
-                    _command = Helper.pronto_to_lirc(_command)
-                    _command = BroadlinkController.lirc_to_broadlink(_command)
-                    _command = b64encode(_command).decode('utf-8')
-                except:
-                    raise Exception("Error while converting "
-                                    "Pronto to Base64 encoding")
+                if (
+                    self._encoding in PROTOCOL_BASED_ENCODING
+                    or self._encoding == ENC_PRONTO
+                ):
+                    # Convert to LIRC then Broadlink Base64
+                    command_bytes = AbstractController.to_lirc(self._encoding, _command)
+                    _command = b64encode(
+                        BroadlinkController.lirc_to_broadlink(command_bytes)
+                    ).decode("utf-8")
+            except:
+                raise Exception(
+                    f"Error while converting {self._encoding} to Base64 encoding"
+                )
 
             commands.append('b64:' + _command)
 
@@ -114,7 +146,8 @@ class BroadlinkController(AbstractController):
 
 
     @staticmethod
-    def lirc_to_broadlink(pulses):
+    def lirc_to_broadlink(pulses: list[float]) -> bytearray:
+        """Convert LIRC pulses to Broadlink format."""
         array = bytearray()
 
         for pulse in pulses:
@@ -148,13 +181,23 @@ class XiaomiController(AbstractController):
 
     async def send(self, command):
         """Send a command."""
+        encoding = self._encoding.lower()
+
+        if self._encoding in PROTOCOL_BASED_ENCODING:
+            # Convert to Pronto
+            command_bytes = AbstractController.to_lirc(self._encoding, command)
+            command_bytes = Helper.lirc_to_pronto(
+                command_bytes, 40.0 if self._encoding == ENC_SONY else 38.0
+            )
+            command = " ".join(f"{b:02X}" for b in command_bytes)
+            encoding = ENC_PRONTO.lower()
+
         service_data = {
             ATTR_ENTITY_ID: self._controller_data,
-            'command':  self._encoding.lower() + ':' + command
+            "command": f"{encoding}:" + command,
         }
 
-        await self.hass.services.async_call(
-            'remote', 'send_command', service_data)
+        await self.hass.services.async_call("remote", "send_command", service_data)
 
 
 class MQTTController(AbstractController):
@@ -188,9 +231,17 @@ class LookinController(AbstractController):
 
     async def send(self, command):
         """Send a command."""
-        encoding = self._encoding.lower().replace('pronto', 'prontohex')
-        url = f"http://{self._controller_data}/commands/ir/" \
-                f"{encoding}/{command}"
+        encoding = self._encoding.lower().replace("pronto", "prontohex")
+        if self._encoding in PROTOCOL_BASED_ENCODING:
+            # Convert to Pronto
+            command_bytes = AbstractController.to_lirc(self._encoding, command)
+            command_bytes = Helper.lirc_to_pronto(
+                command_bytes, 40.0 if self._encoding == ENC_SONY else 38.0
+            )
+            command = " ".join(f"{b:02X}" for b in command_bytes)
+            encoding = "prontohex"
+
+        url = f"http://{self._controller_data}/commands/ir/{encoding}/{command}"
         await self.hass.async_add_executor_job(requests.get, url)
 
 
